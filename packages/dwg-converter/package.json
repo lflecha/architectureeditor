@@ -1,0 +1,16 @@
+{
+  "name": "@pascal-app/dwg-converter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "convert": "bun run ./scripts/convert.mjs"
+  },
+  "dependencies": {
+    "@mlightcad/libredwg-web": "^0.7.9",
+    "@pascal-app/core": "workspace:*"
+  }
+}

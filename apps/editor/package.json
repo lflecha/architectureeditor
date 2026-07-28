@@ -11,9 +11,11 @@
     "check-types": "next typegen && tsgo --noEmit"
   },
   "dependencies": {
+    "@mlightcad/libredwg-web": "^0.7.9",
     "@iconify/react": "^6.0.2",
     "@number-flow/react": "^0.6.0",
     "@pascal-app/core": "*",
+    "@pascal-app/dwg-converter": "workspace:*",
     "@pascal-app/editor": "*",
     "@pascal-app/mcp": "*",
     "@pascal-app/nodes": "*",

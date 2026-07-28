@@ -11,6 +11,7 @@ const nextConfig: NextConfig = {
     'three',
     '@pascal-app/viewer',
     '@pascal-app/core',
+    '@pascal-app/dwg-converter',
     '@pascal-app/editor',
     '@pascal-app/mcp',
     '@pascal-app/plugin-trees',
