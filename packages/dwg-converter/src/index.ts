@@ -4,6 +4,7 @@ import {
   ColumnNode,
   DEFAULT_LEVEL_HEIGHT,
   DoorNode,
+  FenceNode,
   LevelNode,
   SiteNode,
   SlabNode,
@@ -56,6 +57,14 @@ const isWallLayer = (l: string) => /_WALL_(EXT|INT)\b/i.test(l)
 const isColumnLayer = (l: string) => /_COLUMN\b/i.test(l)
 const isDoorLayer = (l: string) => /-M_DOOR\b/i.test(l) // main door layer, not _PANEL/_FRAME
 const isWindowLayer = (l: string) => /-M_WINDOW\b/i.test(l)
+const isRailingLayer = (l: string) => /_RAILING\b/i.test(l)
+
+// Wall paint defaults for DWG imports: a flat painted finish reads far closer
+// to a real building than the schema's raw-drywall default. Curtain-wall
+// panels synthesized for unhosted glazing (see `synthesizeGlazingHost`) get a
+// glass finish instead.
+const PAINTED_WHITE_SLOTS = { interior: 'library:preset-white', exterior: 'library:preset-white' }
+const GLAZING_SLOTS = { interior: 'library:preset-glass', exterior: 'library:preset-glass' }
 
 // ---------------------------------------------------------------------------
 // Small 2D geometry helpers (millimetres throughout until final scaling)
@@ -102,6 +111,39 @@ async function readDwg(buffer: ArrayBuffer | Uint8Array) {
   if (data === undefined || data === 0) throw new Error('Failed to read DWG file')
   const db = dwg.convert(data)
   return db
+}
+
+/**
+ * Some symbols (e.g. the railing/balustrade block) place their INSERT at a
+ * dummy anchor (insertion point 0,0,0) and draw the real geometry as LINEs
+ * inside the block definition itself. Resolve those LINEs into world-space
+ * segments by applying the insert's own rotation/scale/position, the same
+ * transform AutoCAD applies when it renders the block reference.
+ */
+function resolveBlockLineSegs(
+  blockByName: Map<string, any>,
+  ins: { pos: Pt; rotation: number; name: string; xScale?: number; yScale?: number },
+  layerFilter: (l: string) => boolean,
+): Seg[] {
+  const block = blockByName.get(ins.name)
+  if (!block?.entities) return []
+  const sx = ins.xScale ?? 1
+  const sy = ins.yScale ?? 1
+  const cos = Math.cos(ins.rotation)
+  const sin = Math.sin(ins.rotation)
+  const toWorld = (p: Pt): Pt => {
+    const sxp = p.x * sx
+    const syp = p.y * sy
+    return { x: sxp * cos - syp * sin + ins.pos.x, y: sxp * sin + syp * cos + ins.pos.y }
+  }
+  const segs: Seg[] = []
+  for (const be of block.entities) {
+    if (be.type !== 'LINE' || !layerFilter(be.layer ?? '')) continue
+    const a = entPoint(be.startPoint ?? be.start)
+    const b = entPoint(be.endPoint ?? be.end)
+    if (a && b) segs.push({ a: toWorld(a), b: toWorld(b), layer: be.layer ?? '' })
+  }
+  return segs
 }
 
 // ---------------------------------------------------------------------------
@@ -199,13 +241,16 @@ interface WallSeg {
  * window, junction and dimension tick. Left un-merged they inflate the wall
  * count by 4–8× and pair badly. This groups segments that lie on the same
  * infinite line (same direction ±2°, same perpendicular offset ±8 mm) and
- * unions their extents along that line, bridging only hairline numeric gaps
- * (≤25 mm) so real openings stay open.
+ * unions their extents along that line, bridging only gaps up to `weldGapMm`
+ * so real openings stay open. Walls keep the default tight (25 mm — hairline
+ * numeric gaps only); other callers merging non-wall dashed symbols (e.g.
+ * railing ticks) may pass a much larger gap since there's no opening to
+ * accidentally bridge.
  */
-function mergeCollinear(segs: Seg[]): Seg[] {
+function mergeCollinear(segs: Seg[], weldGapMm = 25): Seg[] {
   const ANGLE_EPS = Math.sin((2 * Math.PI) / 180)
   const OFFSET_EPS = 8 // mm perpendicular
-  const WELD_GAP = 25 // mm — welds split lines, never bridges a door opening
+  const WELD_GAP = weldGapMm
 
   interface Group {
     dir: Pt // canonical (rightward/upward) unit direction
@@ -271,6 +316,49 @@ function mergeCollinear(segs: Seg[]): Seg[] {
     flush()
   }
   return out
+}
+
+/**
+ * Greedily walk a bag of (already merge-collinear'd) segments into one
+ * ordered point chain, repeatedly attaching whichever remaining segment has
+ * an endpoint closest to either open end of the chain so far. Good enough
+ * for the 1–4 segment balcony-edge runs this feeds; not a general solver.
+ */
+function chainSegments(segs: Seg[]): Pt[] {
+  if (!segs.length) return []
+  const remaining = segs.slice(1)
+  const pts: Pt[] = [segs[0].a, segs[0].b]
+  while (remaining.length) {
+    const tail = pts[pts.length - 1]
+    const head = pts[0]
+    let bestIdx = -1
+    let bestDist = Infinity
+    let atTail = true
+    let flip = false
+    for (let i = 0; i < remaining.length; i++) {
+      const s = remaining[i]
+      const candidates: [number, boolean, boolean][] = [
+        [len(sub(s.a, tail)), true, false],
+        [len(sub(s.b, tail)), true, true],
+        [len(sub(s.a, head)), false, true],
+        [len(sub(s.b, head)), false, false],
+      ]
+      for (const [dist, isTail, doFlip] of candidates) {
+        if (dist < bestDist) {
+          bestDist = dist
+          bestIdx = i
+          atTail = isTail
+          flip = doFlip
+        }
+      }
+    }
+    const s = remaining.splice(bestIdx, 1)[0]
+    const first = flip ? s.b : s.a
+    const second = flip ? s.a : s.b
+    if (atTail) pts.push(first, second)
+    else pts.unshift(second, first)
+  }
+  return pts
 }
 
 function buildWalls(rawSegs: Seg[], opts: Required<ConvertOptions>): WallSeg[] {
@@ -399,12 +487,16 @@ export async function convertDwgToPascal(
 
   const db = await readDwg(buffer)
   const ents: any[] = db.entities ?? []
+  const blockByName = new Map<string, any>(
+    (db.tables?.BLOCK_RECORD?.entries ?? []).map((b: any) => [b.name, b]),
+  )
 
   // Collect segments and inserts by classification
   const wallSegs: Seg[] = []
   const columnInserts: Insert[] = []
   const doorInserts: Insert[] = []
   const windowInserts: Insert[] = []
+  const railingInstances: Seg[][] = []
   for (const e of ents) {
     const layer: string = e.layer ?? ''
     if (e.type === 'LINE' && isWallLayer(layer)) {
@@ -418,6 +510,14 @@ export async function convertDwgToPascal(
       if (isColumnLayer(layer)) columnInserts.push(ins)
       else if (isDoorLayer(layer)) doorInserts.push(ins)
       else if (isWindowLayer(layer)) windowInserts.push(ins)
+      else if (isRailingLayer(layer)) {
+        const segs = resolveBlockLineSegs(
+          blockByName,
+          { pos, rotation: e.rotation ?? 0, name: e.name ?? '', xScale: e.xScale, yScale: e.yScale },
+          isRailingLayer,
+        )
+        if (segs.length) railingInstances.push(segs)
+      }
     }
   }
 
@@ -479,6 +579,7 @@ export async function convertDwgToPascal(
       start: MX(w.start),
       end: MX(w.end),
       thickness: Math.max(0.05, w.thickness / 1000),
+      slots: PAINTED_WHITE_SLOTS,
       children: [],
     }) as any
     nodes[node.id] = node
@@ -564,15 +665,45 @@ export async function convertDwgToPascal(
     doorCount++
   }
 
+  // Curtain-wall glazing: a window with no wall nearby usually means that
+  // stretch of façade is drawn as glazing units only, with no backing wall
+  // line at all. Rather than drop it, sit it in a slender glass-finish wall
+  // synthesized along the insert's own rotation so it still renders as a
+  // real opening.
+  const GLAZING_THICKNESS_MM = 120
+  const GLAZING_PADDING_MM = 300 // clearance either side of the glass unit
+  const synthesizeGlazingHost = (wi: Insert, widthMm: number): { wall: (typeof wallNodes)[number]; u: number } => {
+    const dir: Pt = { x: Math.cos(wi.rotation), y: Math.sin(wi.rotation) }
+    const halfLen = (widthMm + GLAZING_PADDING_MM) / 2
+    const start = { x: wi.pos.x - dir.x * halfLen, y: wi.pos.y - dir.y * halfLen }
+    const end = { x: wi.pos.x + dir.x * halfLen, y: wi.pos.y + dir.y * halfLen }
+    const node = WallNode.parse({
+      object: 'node',
+      type: 'wall',
+      parentId: level.id,
+      start: MX(start),
+      end: MX(end),
+      thickness: GLAZING_THICKNESS_MM / 1000,
+      slots: GLAZING_SLOTS,
+      children: [],
+    }) as any
+    nodes[node.id] = node
+    level.children.push(node.id)
+    const wall = { node, start, end }
+    wallNodes.push(wall)
+    return { wall, u: halfLen }
+  }
+
   // --- Windows: host to nearest wall; derive a sill so the head clears the
   // ceiling. Tall units (awning/curtain-wall glazing) drop to a low sill. ---
   let windowCount = 0
+  let glazingPanelCount = 0
   for (const wi of windowInserts) {
     const dims = parseWindowDims(wi.name)
-    const host = findHost(wi.pos, dims.width)
+    let host = findHost(wi.pos, dims.width)
     if (!host) {
-      warnings.push(`Window "${wi.name.slice(0, 24)}" not near any wall; skipped`)
-      continue
+      host = synthesizeGlazingHost(wi, dims.width)
+      glazingPanelCount++
     }
     const heightM = dims.height / 1000
     const levelM = opts.levelHeight
@@ -592,6 +723,38 @@ export async function convertDwgToPascal(
     nodes[node.id] = node
     host.wall.node.children.push(node.id)
     windowCount++
+  }
+
+  // --- Balcony balustrades: each railing INSERT resolves to a handful of
+  // LINE dashes tracing one continuous run (the CAD symbol breaks them at
+  // periodic ticks, not real gaps) — weld them back into a run and walk the
+  // result into an ordered path for one FenceNode per balcony edge. ---
+  const RAILING_WELD_GAP_MM = 3000 // generous: each instance is already its
+  // own block/balcony, so there's no risk of bridging across different runs
+  // the way a small gap would for wall face-lines.
+  const BALUSTRADE_HEIGHT_M = 1.0
+  const BALUSTRADE_THICKNESS_M = 0.05
+  let balustradeCount = 0
+  for (const instanceSegs of railingInstances) {
+    const merged = mergeCollinear(instanceSegs, RAILING_WELD_GAP_MM)
+    if (!merged.length) continue
+    const chain = chainSegments(merged)
+    if (chain.length < 2) continue
+    const pts = chain.map((p) => MX(p))
+    const node = FenceNode.parse({
+      object: 'node',
+      type: 'fence',
+      parentId: level.id,
+      start: pts[0],
+      end: pts[pts.length - 1],
+      ...(pts.length > 2 ? { path: pts } : {}),
+      height: BALUSTRADE_HEIGHT_M,
+      thickness: BALUSTRADE_THICKNESS_M,
+      style: 'rail',
+    }) as any
+    nodes[node.id] = node
+    level.children.push(node.id)
+    balustradeCount++
   }
 
   // --- Floor slab: convex hull of wall endpoints ---
@@ -619,10 +782,13 @@ export async function convertDwgToPascal(
       columns: columnCount,
       doors: doorCount,
       windows: windowCount,
+      glazingPanels: glazingPanelCount,
+      balustrades: balustradeCount,
       rawWallLines: wallSegs.length,
       rawColumnInserts: columnInserts.length,
       rawDoorInserts: doorInserts.length,
       rawWindowInserts: windowInserts.length,
+      rawRailingInserts: railingInstances.length,
       warnings,
     },
   }

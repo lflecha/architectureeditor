@@ -13,7 +13,7 @@ async function importBuffer(buffer: ArrayBuffer): Promise<string> {
     rootNodeIds: result.rootNodeIds,
   } as never)
   const s = result.stats
-  return `${s.walls} walls · ${s.columns} columns · ${s.doors} doors · ${s.windows} windows`
+  return `${s.walls} walls · ${s.columns} columns · ${s.doors} doors · ${s.windows} windows · ${s.balustrades} balustrades`
 }
 
 /**
