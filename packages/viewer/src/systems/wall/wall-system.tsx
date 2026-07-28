@@ -472,6 +472,50 @@ function getWallBandSplitPlanes(wall: WallNode, effectiveWallHeight: number): nu
 
 let useFrameNb = 0
 
+// ─── Miter-data cache ──────────────────────────────────────────────────────
+//
+// `calculateLevelMiters` is O(walls²) (junction + T-junction detection). The
+// rebuild loop below runs it *every frame* while a batch of dirty walls
+// drains 8-at-a-time — fine for a 4-wall room, catastrophic for a 500-wall
+// DWG import where the same O(n²) pass repeats for ~100+ frames even though
+// the walls never move between frames.
+//
+// The miter geometry depends only on each wall's endpoints, thickness and
+// curve — not on which meshes happen to be rebuilding this frame. So we hash
+// those fields (cheap, O(n)) and reuse the previous frame's result whenever
+// the hash is unchanged. A drag mutates endpoints → hash changes → recompute,
+// so interactive correctness is preserved; a static import computes the miter
+// pass exactly once.
+const miterCache = new Map<string, { hash: number; data: WallMiterData }>()
+
+function levelWallsMiterHash(walls: WallNode[]): number {
+  let h = 2166136261 >>> 0
+  const mix = (n: number) => {
+    h ^= n | 0
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  for (const w of walls) {
+    for (let i = 0; i < w.id.length; i++) mix(w.id.charCodeAt(i))
+    mix((w.start[0] * 1000) | 0)
+    mix((w.start[1] * 1000) | 0)
+    mix((w.end[0] * 1000) | 0)
+    mix((w.end[1] * 1000) | 0)
+    mix(((w.thickness ?? 0.1) * 1000) | 0)
+    if (w.curveOffset) mix((w.curveOffset * 1000) | 0)
+  }
+  mix(walls.length)
+  return h
+}
+
+function getLevelMiterData(levelId: string, levelWalls: WallNode[]): WallMiterData {
+  const hash = levelWallsMiterHash(levelWalls)
+  const cached = miterCache.get(levelId)
+  if (cached && cached.hash === hash) return cached.data
+  const data = calculateLevelMiters(levelWalls)
+  miterCache.set(levelId, { hash, data })
+  return data
+}
+
 // ─── Drag-throttle state (singleton — one WallSystem mounted globally) ──
 //
 // Endpoint drags fire `markDirty(wallId)` on every pointermove tick. Without
@@ -488,7 +532,12 @@ let useFrameNb = 0
 const DRAG_FLUSH_MS = 80
 const MAX_WALL_REBUILDS_PER_FRAME = 8
 const WALL_PROGRESSIVE_DIRTY_THRESHOLD = MAX_WALL_REBUILDS_PER_FRAME
-const WALL_PROGRESSIVE_TIME_BUDGET_MS = 8
+// Bulk load/import (hundreds of dirty walls at once) isn't interactive — no
+// cursor to keep up with — so we can afford heavier frames to drain faster.
+// A larger batch + budget cuts the frame count several-fold on big DWG imports
+// while the drag path keeps its small, responsive 8-wall/8-ms cap.
+const WALL_PROGRESSIVE_TIME_BUDGET_MS = 16
+const WALL_PROGRESSIVE_MAX_REBUILDS_PER_FRAME = 24
 let lastWallDirtyAtMs = 0
 const pendingAdjacentByLevel = new Map<string, Set<string>>()
 
@@ -551,12 +600,15 @@ export const WallSystem = () => {
 
     // Process each level that has dirty walls
     for (const [levelId, dirtyWallIds] of dirtyWallsByLevel) {
-      if (useProgressiveWallRebuilds && rebuiltWallsThisFrame >= MAX_WALL_REBUILDS_PER_FRAME) {
+      if (
+        useProgressiveWallRebuilds &&
+        rebuiltWallsThisFrame >= WALL_PROGRESSIVE_MAX_REBUILDS_PER_FRAME
+      ) {
         break
       }
 
       const levelWalls = getLevelWalls(levelId)
-      const miterData = calculateLevelMiters(levelWalls)
+      const miterData = getLevelMiterData(levelId, levelWalls)
       const rebuiltWallIds = new Set<string>()
 
       // Update dirty walls — always, no throttling. The dragged wall must
@@ -564,7 +616,7 @@ export const WallSystem = () => {
       // enter the progressive path so initial load can't lock the tab.
       for (const wallId of dirtyWallIds) {
         if (useProgressiveWallRebuilds) {
-          if (rebuiltWallsThisFrame >= MAX_WALL_REBUILDS_PER_FRAME) {
+          if (rebuiltWallsThisFrame >= WALL_PROGRESSIVE_MAX_REBUILDS_PER_FRAME) {
             break
           }
           if (
@@ -591,15 +643,24 @@ export const WallSystem = () => {
 
       // Adjacent walls sharing junctions — *defer* during active drag
       // (dirty arrived this frame), flush on the trailing edge.
-      const adjacentWallIds = getAdjacentWallIds(levelWalls, rebuiltWallIds)
-      let pending = pendingAdjacentByLevel.get(levelId)
-      if (!pending) {
-        pending = new Set()
-        pendingAdjacentByLevel.set(levelId, pending)
-      }
-      for (const wallId of adjacentWallIds) {
-        if (!dirtyWallIds.has(wallId)) {
-          pending.add(wallId)
+      //
+      // Skipped entirely for bulk rebuilds: a mass load/import marks every wall
+      // dirty at once, so each one's first rebuild already reads the final,
+      // cached miter data — its neighbors need no second pass. Re-queuing them
+      // would roughly double the work (515 walls → ~1000 rebuilds) for no
+      // visual change. The drag path (few dirty walls) still needs it, because
+      // a neighbor rebuilt on an earlier tick used the pre-drag miter.
+      if (!useProgressiveWallRebuilds) {
+        const adjacentWallIds = getAdjacentWallIds(levelWalls, rebuiltWallIds)
+        let pending = pendingAdjacentByLevel.get(levelId)
+        if (!pending) {
+          pending = new Set()
+          pendingAdjacentByLevel.set(levelId, pending)
+        }
+        for (const wallId of adjacentWallIds) {
+          if (!dirtyWallIds.has(wallId)) {
+            pending.add(wallId)
+          }
         }
       }
     }
@@ -617,7 +678,7 @@ export const WallSystem = () => {
       for (const [levelId, pendingIds] of pendingAdjacentByLevel) {
         if (pendingIds.size === 0) continue
         const levelWalls = getLevelWalls(levelId)
-        const miterData = calculateLevelMiters(levelWalls)
+        const miterData = getLevelMiterData(levelId, levelWalls)
         for (const wallId of Array.from(pendingIds)) {
           if (useProgressiveAdjacentRebuilds) {
             if (rebuiltAdjacentThisFrame >= MAX_WALL_REBUILDS_PER_FRAME) {

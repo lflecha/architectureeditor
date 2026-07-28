@@ -157,7 +157,89 @@ interface WallSeg {
   thickness: number
 }
 
-function buildWalls(segs: Seg[], opts: Required<ConvertOptions>): WallSeg[] {
+/**
+ * Weld collinear face-lines into continuous runs.
+ *
+ * CAD walls are drawn as many short LINE entities, broken at every door,
+ * window, junction and dimension tick. Left un-merged they inflate the wall
+ * count by 4–8× and pair badly. This groups segments that lie on the same
+ * infinite line (same direction ±2°, same perpendicular offset ±8 mm) and
+ * unions their extents along that line, bridging only hairline numeric gaps
+ * (≤25 mm) so real openings stay open.
+ */
+function mergeCollinear(segs: Seg[]): Seg[] {
+  const ANGLE_EPS = Math.sin((2 * Math.PI) / 180)
+  const OFFSET_EPS = 8 // mm perpendicular
+  const WELD_GAP = 25 // mm — welds split lines, never bridges a door opening
+
+  interface Group {
+    dir: Pt // canonical (rightward/upward) unit direction
+    ref: Pt // a point on the line
+    perp: Pt // unit normal
+    items: { lo: number; hi: number; off: number }[]
+  }
+  const groups: Group[] = []
+
+  for (const s of segs) {
+    const d = unit(sub(s.b, s.a))
+    // Canonicalise direction so a→b and b→a land in the same group.
+    const cd = d.x < 0 || (d.x === 0 && d.y < 0) ? { x: -d.x, y: -d.y } : d
+    const perp = { x: -cd.y, y: cd.x }
+    let g = groups.find(
+      (g) =>
+        Math.abs(cross(g.dir, cd)) <= ANGLE_EPS &&
+        Math.abs(dot(sub(s.a, g.ref), g.perp)) <= OFFSET_EPS,
+    )
+    if (!g) {
+      g = { dir: cd, ref: s.a, perp, items: [] }
+      groups.push(g)
+    }
+    const ta = projectParam(s.a, g.ref, g.dir)
+    const tb = projectParam(s.b, g.ref, g.dir)
+    const off = (dot(sub(s.a, g.ref), g.perp) + dot(sub(s.b, g.ref), g.perp)) / 2
+    g.items.push({ lo: Math.min(ta, tb), hi: Math.max(ta, tb), off })
+  }
+
+  const out: Seg[] = []
+  for (const g of groups) {
+    g.items.sort((a, b) => a.lo - b.lo)
+    let lo = g.items[0].lo
+    let hi = g.items[0].hi
+    let offSum = g.items[0].off
+    let offN = 1
+    const flush = () => {
+      const off = offSum / offN
+      const a = {
+        x: g.ref.x + g.dir.x * lo + g.perp.x * off,
+        y: g.ref.y + g.dir.y * lo + g.perp.y * off,
+      }
+      const b = {
+        x: g.ref.x + g.dir.x * hi + g.perp.x * off,
+        y: g.ref.y + g.dir.y * hi + g.perp.y * off,
+      }
+      out.push({ a, b, layer: '' })
+    }
+    for (let k = 1; k < g.items.length; k++) {
+      const iv = g.items[k]
+      if (iv.lo <= hi + WELD_GAP) {
+        hi = Math.max(hi, iv.hi)
+        offSum += iv.off
+        offN++
+      } else {
+        flush()
+        lo = iv.lo
+        hi = iv.hi
+        offSum = iv.off
+        offN = 1
+      }
+    }
+    flush()
+  }
+  return out
+}
+
+function buildWalls(rawSegs: Seg[], opts: Required<ConvertOptions>): WallSeg[] {
+  const segs = mergeCollinear(rawSegs)
   const minT = opts.minWallThicknessMm
   const maxT = opts.maxWallThicknessMm
   const used = new Array(segs.length).fill(false)
@@ -166,6 +248,10 @@ function buildWalls(segs: Seg[], opts: Required<ConvertOptions>): WallSeg[] {
   const MIN_OVERLAP = 150 // mm
   const MIN_LEN = 150
   const MAX_LEN = 60000
+  // Unpaired lines only become single-face walls above this length. A wall
+  // with no matching second face is usually a façade/partition drawn single-
+  // line; anything shorter is almost always a jamb, tick or fragment.
+  const SINGLE_FACE_MIN_LEN = 600
 
   for (let i = 0; i < segs.length; i++) {
     if (used[i]) continue
@@ -212,8 +298,8 @@ function buildWalls(segs: Seg[], opts: Required<ConvertOptions>): WallSeg[] {
       const midB = { x: (si.b.x + closest(sj, si.b).x) / 2, y: (si.b.y + closest(sj, si.b).y) / 2 }
       walls.push({ start: midA, end: midB, thickness: bestThick })
     } else {
-      // unpaired: emit as a single-face wall if plausibly a wall run
-      if (li >= MIN_LEN && li <= MAX_LEN) {
+      // unpaired: emit as a single-face wall only if plausibly a wall run
+      if (li >= SINGLE_FACE_MIN_LEN && li <= MAX_LEN) {
         used[i] = true
         walls.push({ start: si.a, end: si.b, thickness: opts.singleFaceThicknessMm })
       } else {
