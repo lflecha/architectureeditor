@@ -8,6 +8,7 @@ import {
   SiteNode,
   SlabNode,
   WallNode,
+  WindowNode,
 } from '@pascal-app/core'
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,7 @@ interface Insert {
 const isWallLayer = (l: string) => /_WALL_(EXT|INT)\b/i.test(l)
 const isColumnLayer = (l: string) => /_COLUMN\b/i.test(l)
 const isDoorLayer = (l: string) => /-M_DOOR\b/i.test(l) // main door layer, not _PANEL/_FRAME
+const isWindowLayer = (l: string) => /-M_WINDOW\b/i.test(l)
 
 // ---------------------------------------------------------------------------
 // Small 2D geometry helpers (millimetres throughout until final scaling)
@@ -106,7 +108,26 @@ async function readDwg(buffer: ArrayBuffer | Uint8Array) {
 // Block-name dimension parsing
 // ---------------------------------------------------------------------------
 
-/** Column: "..._Rectangular_... - 1000_w_x500..." or "..._Round_... - Diamater_900mm". */
+// Dimensions live in the middle " - " segment of the block name (e.g.
+// "... - 1500_w_x400_d_mm-12468747-L27 - EAST_PHASE 1"), NOT the last one — so
+// scan the whole name. Widths are tagged `_w` (a door may list several, e.g.
+// "920_920_w"), heights `_h`, column depths `_d`. The negative lookahead stops
+// a tag from matching mid-word.
+
+/** Millimetre width(s) immediately before an `_w` tag, e.g. "920_920_w" → [920,920]. */
+function parseWidthsMm(name: string): number[] {
+  const m = name.match(/(\d{2,5}(?:_\d{2,5})*)_w(?![a-z0-9])/i)
+  if (!m) return []
+  return m[1].split('_').map(Number).filter((n) => n >= 10)
+}
+
+/** Millimetre value before an `_<tag>` (h = height, d = depth). */
+function parseTagMm(name: string, tag: 'h' | 'd'): number | undefined {
+  const m = name.match(new RegExp(`(\\d{2,5})_${tag}(?![a-z0-9])`, 'i'))
+  return m ? Number(m[1]) : undefined
+}
+
+/** Column: "..._Rectangular_Concrete - 1500_w_x400_d_mm..." or "..._Round_... 900mm". */
 function parseColumnDims(name: string): {
   crossSection: 'rectangular' | 'round'
   width: number
@@ -114,37 +135,51 @@ function parseColumnDims(name: string): {
   radius?: number
 } {
   if (/round|diamater|diameter/i.test(name)) {
-    const m = name.match(/(\d{2,5})\s*mm/i) || name.match(/(\d{2,5})/)
-    const dia = m ? Number(m[1]) : 440
+    const dia = parseWidthsMm(name)[0] ?? parseTagMm(name, 'd') ?? 440
     return { crossSection: 'round', width: dia, depth: dia, radius: dia / 2 }
   }
-  // rectangular: grab the two dimensions after the last " - "
-  const tail = name.split(' - ').pop() ?? name
-  const nums = tail.match(/\d{2,5}/g)?.map(Number) ?? []
-  const width = nums[0] ?? 440
-  const depth = nums[1] ?? width
+  const width = parseWidthsMm(name)[0] ?? 440
+  const depth = parseTagMm(name, 'd') ?? width
   return { crossSection: 'rectangular', width, depth }
 }
 
-/** Door: "..._Sliding_..._4Panel_OXXO - 4000_w_x2700_h..." or "..._Swing_Dbl - 920_920_w_x2340_h_". */
+/** Door: "..._Swing_Sgl1 - Door_Entry_920_w_x2340_h_..." / "..._Sliding_..._2Panel_XO - 3000_w_ x 2700_h_". */
 function parseDoorDims(name: string): {
   width: number
   height: number
-  doorType: string
+  doorType: 'hinged' | 'double' | 'sliding'
   leafCount: 1 | 2 | 3 | 4
 } {
-  const tail = name.split(' - ').pop() ?? name
-  // widths appear before "_w", height before "_h"
-  const wMatch = tail.match(/([\d_]+?)_w/i)
-  const widths = wMatch ? wMatch[1].split('_').map(Number).filter(Boolean) : []
+  const widths = parseWidthsMm(name)
   const width = widths.length ? widths.reduce((a, b) => a + b, 0) : 900
-  const hMatch = tail.match(/x?\s*(\d{3,5})_h/i)
-  const height = hMatch ? Number(hMatch[1]) : 2100
+  const height = parseTagMm(name, 'h') ?? 2100
   const sliding = /sliding/i.test(name)
-  const dbl = /_dbl|double/i.test(name) || widths.length >= 2
+  const dbl = /_dbl\b|double/i.test(name) || widths.length >= 2
   const doorType = sliding ? 'sliding' : dbl ? 'double' : 'hinged'
   const leafCount = (widths.length >= 4 ? 4 : widths.length >= 2 ? 2 : 1) as 1 | 2 | 4
   return { width, height, doorType, leafCount }
+}
+
+/** Window: "..._Awning_DblRow_AO - 1500_w_x2550_h_..." / "..._Sliding_XO - 1500_w_ x 1900_h_". */
+function parseWindowDims(name: string): {
+  width: number
+  height: number
+  windowType: 'fixed' | 'sliding' | 'casement' | 'awning' | 'hopper' | 'double-hung'
+} {
+  const width = parseWidthsMm(name)[0] ?? 1500
+  const height = parseTagMm(name, 'h') ?? 1500
+  const windowType = /awning/i.test(name)
+    ? 'awning'
+    : /sliding/i.test(name)
+      ? 'sliding'
+      : /casement/i.test(name)
+        ? 'casement'
+        : /hopper/i.test(name)
+          ? 'hopper'
+          : /hung/i.test(name)
+            ? 'double-hung'
+            : 'fixed'
+  return { width, height, windowType }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +404,7 @@ export async function convertDwgToPascal(
   const wallSegs: Seg[] = []
   const columnInserts: Insert[] = []
   const doorInserts: Insert[] = []
+  const windowInserts: Insert[] = []
   for (const e of ents) {
     const layer: string = e.layer ?? ''
     if (e.type === 'LINE' && isWallLayer(layer)) {
@@ -381,6 +417,7 @@ export async function convertDwgToPascal(
       const ins: Insert = { pos, rotation: e.rotation ?? 0, name: e.name ?? '', layer }
       if (isColumnLayer(layer)) columnInserts.push(ins)
       else if (isDoorLayer(layer)) doorInserts.push(ins)
+      else if (isWindowLayer(layer)) windowInserts.push(ins)
     }
   }
 
@@ -472,44 +509,89 @@ export async function convertDwgToPascal(
     columnCount++
   }
 
-  // --- Doors: host to nearest wall centreline within threshold ---
-  let doorCount = 0
-  const HOST_THRESHOLD = 2000 // mm
-  for (const d of doorInserts) {
-    const dims = parseDoorDims(d.name)
+  // Host an opening (door/window) at DWG position `pos` to the nearest wall
+  // centreline. Returns the wall node and the along-wall offset `u` (mm),
+  // clamped so a `widthMm`-wide opening sits fully within the wall run instead
+  // of hanging off the end (walls are drawn broken at each opening, so the
+  // insertion point often lands near a stub's end).
+  const HOST_THRESHOLD = 2000 // mm perpendicular
+  const findHost = (pos: Pt, widthMm: number): { wall: any; u: number } | null => {
+    const halfW = widthMm / 2
     let bestWall: any = null
     let bestDist = Infinity
     let bestU = 0
+    let bestWl = 0
     for (const w of wallNodes) {
       const dir = unit(sub(w.end, w.start))
-      const gap = perpDistance(d.pos, w.start, w.end)
-      const u = projectParam(d.pos, w.start, dir)
       const wl = len(sub(w.end, w.start))
-      if (u < 0 || u > wl) continue
+      const u = projectParam(pos, w.start, dir)
+      if (u < -halfW || u > wl + halfW) continue
+      const gap = perpDistance(pos, w.start, w.end)
       if (gap < bestDist) {
         bestDist = gap
         bestWall = w
         bestU = u
+        bestWl = wl
       }
     }
-    if (!bestWall || bestDist > HOST_THRESHOLD) {
+    if (!bestWall || bestDist > HOST_THRESHOLD) return null
+    const u = bestWl >= widthMm ? Math.min(Math.max(bestU, halfW), bestWl - halfW) : bestWl / 2
+    return { wall: bestWall, u }
+  }
+
+  // --- Doors: host to nearest wall centreline, sit on the floor ---
+  let doorCount = 0
+  for (const d of doorInserts) {
+    const dims = parseDoorDims(d.name)
+    const host = findHost(d.pos, dims.width)
+    if (!host) {
       warnings.push(`Door "${d.name.slice(0, 24)}" not near any wall; skipped`)
       continue
     }
     const node = DoorNode.parse({
       object: 'node',
       type: 'door',
-      parentId: bestWall.node.id,
-      wallId: bestWall.node.id,
-      position: [bestU / 1000, dims.height / 1000 / 2, 0],
+      parentId: host.wall.node.id,
+      wallId: host.wall.node.id,
+      position: [host.u / 1000, dims.height / 1000 / 2, 0],
       width: dims.width / 1000,
       height: dims.height / 1000,
       doorType: dims.doorType,
       leafCount: dims.leafCount,
     }) as any
     nodes[node.id] = node
-    bestWall.node.children.push(node.id)
+    host.wall.node.children.push(node.id)
     doorCount++
+  }
+
+  // --- Windows: host to nearest wall; derive a sill so the head clears the
+  // ceiling. Tall units (awning/curtain-wall glazing) drop to a low sill. ---
+  let windowCount = 0
+  for (const wi of windowInserts) {
+    const dims = parseWindowDims(wi.name)
+    const host = findHost(wi.pos, dims.width)
+    if (!host) {
+      warnings.push(`Window "${wi.name.slice(0, 24)}" not near any wall; skipped`)
+      continue
+    }
+    const heightM = dims.height / 1000
+    const levelM = opts.levelHeight
+    // Bottom of glass: keep a normal ~0.9 m sill where it fits, else drop it so
+    // the head stays under the slab (floor-to-ceiling glazing → sill ≈ 0).
+    const sill = Math.max(0, Math.min(0.9, levelM - heightM - 0.1))
+    const node = WindowNode.parse({
+      object: 'node',
+      type: 'window',
+      parentId: host.wall.node.id,
+      wallId: host.wall.node.id,
+      position: [host.u / 1000, sill + heightM / 2, 0],
+      width: dims.width / 1000,
+      height: heightM,
+      windowType: dims.windowType,
+    }) as any
+    nodes[node.id] = node
+    host.wall.node.children.push(node.id)
+    windowCount++
   }
 
   // --- Floor slab: convex hull of wall endpoints ---
@@ -536,9 +618,11 @@ export async function convertDwgToPascal(
       pairedWalls: wallSpecs.filter((w) => w.thickness !== opts.singleFaceThicknessMm).length,
       columns: columnCount,
       doors: doorCount,
+      windows: windowCount,
       rawWallLines: wallSegs.length,
       rawColumnInserts: columnInserts.length,
       rawDoorInserts: doorInserts.length,
+      rawWindowInserts: windowInserts.length,
       warnings,
     },
   }
